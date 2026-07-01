@@ -1,145 +1,143 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-Hierarchical shopping assistant using LangChain 1.x and a local LLM.
-The script demonstrates:
-- A tool `get_price(product, city)` that internally creates a sub‑agent to generate a price table.
-- A top‑level agent that uses the tool to answer a user query about a shopping list.
+Простой AI‑агент на LangChain + LangGraph, который:
+1) Принимает список продуктов и город.
+2) Для каждого продукта запрашивает цену через инструмент get_price.
+3) Считает итоговую стоимость корзины и выводит таблицу.
+
+Требования к окружению:
+- Python 3.10+
+- LM Studio (локальный сервер LLM) доступен по адресу https://llm.brojs.ru/v1
 """
 
 import os
-import sys
 from dotenv import load_dotenv
-from typing import Annotated, TypedDict
 
-# LangChain imports (1.x)
-from langchain_openai import ChatOpenAI
-from langchain.tools import tool
-from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from langgraph.checkpoint.memory import MemorySaver
-
-# Load environment variables (API key for the remote LLM endpoint)
+# Загружаем переменные окружения, если они есть
 load_dotenv()
 
-# --------------------------------------------------------------------------- #
-# 1. Configure the LLM
-# --------------------------------------------------------------------------- #
+# ------------------------------------------------------------------
+# Подключаемся к локальной модели через OpenAI‑совместимый API
+# ------------------------------------------------------------------
+from langchain_openai import ChatOpenAI
+from pydantic import SecretStr
 
 llm = ChatOpenAI(
-    base_url=os.getenv("LLM_BASE_URL", "https://llm.brojs.ru/v1"),
-    api_key=os.getenv("BROJS_PAT_TOKEN"),
-    model="openai/gpt-oss-20b",
-    temperature=0.1,
+    model="gpt-4o-mini",          # <-- замените на название вашей модели в LM Studio
+    base_url="https://llm.brojs.ru/v1",
+    api_key=SecretStr(os.getenv("BROJS_PAT_TOKEN") or "fake"),
+    temperature=0.7,
 )
 
-# --------------------------------------------------------------------------- #
-# 2. Define the `get_price` tool with an internal sub‑agent
-# --------------------------------------------------------------------------- #
+# ------------------------------------------------------------------
+# Определяем инструмент get_price с субагентом (простой вызов LLM)
+# ------------------------------------------------------------------
+from langchain.tools import tool
+from langchain_core.messages import HumanMessage, AIMessage
 
 @tool
 def get_price(product: str, city: str) -> str:
     """
     Получить примерную цену продукта в указанном городе.
+    Возвращает строку‑таблицу вида:
 
-    Returns a markdown table with columns:
-        | Продукт | Цена (руб.) | Магазин |
-    The response contains only the table without any additional text.
+    | Продукт | Цена (руб.) | Магазин |
     """
-    # Sub‑agent that generates the price table
-    def sub_agent_call(product: str, city: str) -> str:
-        system_prompt = (
-            f"Ты эксперт по ценам на продукты в {city}. "
-            "Сгенерируй таблицу с колонками: Продукт, Цена (руб.), Магазин. "
-            "Ответ должен быть только таблицей без лишних слов."
-        )
-        # Simple agent that just calls the LLM once
-        response = llm.invoke(
-            [
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": f"Какова цена на {product} в {city}?",
-                },
-            ]
-        )
-        # The last message is the assistant's reply
-        return response.content
+    # Формируем запрос к модели
+    prompt = (
+        f"Сгенерируй таблицу с ценой для продукта '{product}' "
+        f"в городе '{city}'. Таблица должна содержать три колонки: "
+        "Продукт, Цена (руб.), Магазин. Используй реалистичные цены и магазины."
+    )
+    # Вызов LLM
+    response = llm.invoke([HumanMessage(content=prompt)])
+    return response.content.strip()
 
-    table = sub_agent_call(product, city)
-    return table
-
-
-# --------------------------------------------------------------------------- #
-# 3. Build the top‑level agent graph
-# --------------------------------------------------------------------------- #
+# ------------------------------------------------------------------
+# Создаём главный агент с инструментом get_price
+# ------------------------------------------------------------------
+from langgraph.prebuilt import ToolNode, tools_condition
+from typing import Annotated
+from typing_extensions import TypedDict
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
 
 class State(TypedDict):
-    messages: Annotated[list, add_messages]
+    messages: Annotated[list[BaseMessage], add_messages]
 
-def call_llm(state: State) -> dict:
-    """Node that calls the LLM with the current conversation."""
+def call_model(state: State) -> dict:
+    """
+    Вызов основной модели для генерации ответа или вызова инструмента.
+    """
     response = llm.invoke(state["messages"])
     return {"messages": [response]}
 
-# Create the graph
+# Создаём граф
 builder = StateGraph(State)
-
-# Agent node
-builder.add_node("agent", call_llm)
-
-# Tool node (contains our single tool)
-tools_node = ToolNode(tools=[get_price])
-builder.add_node("tools", tools_node)
-
-# Graph edges
+builder.add_node("agent", call_model)
+builder.add_node("tools", ToolNode(tools=[get_price]))
 builder.add_edge(START, "agent")
 builder.add_conditional_edges("agent", tools_condition)
 builder.add_edge("tools", "agent")
 
-# End state
-builder.add_edge("agent", END)
+graph = builder.compile()
 
-# Set the entry point to the agent node (not START)
-builder.set_entry_point("agent")
-
-# Compile the graph with a memory checkpoint
-memory = MemorySaver()
-graph = builder.compile(checkpointer=memory)
-
-# --------------------------------------------------------------------------- #
-# 4. Run the agent with a predefined user query
-# --------------------------------------------------------------------------- #
-
+# ------------------------------------------------------------------
+# Запускаем агента с примерным запросом
+# ------------------------------------------------------------------
 if __name__ == "__main__":
-    # Predefined user question (no TTY interaction)
-    user_query = (
+    # Примерный вопрос пользователя
+    user_question = (
         "Помоги составить список покупок: молоко, хлеб, яблоки. Я нахожусь в Казани."
     )
 
-    # Configuration for the thread
-    config = {"configurable": {"thread_id": "shopping_thread"}}
-
-    # Invoke the graph
+    # Запускаем граф
+    config = {"configurable": {"thread_id": "shopping_agent"}}
     result = graph.invoke(
-        {"messages": [{"role": "human", "content": user_query}]},
+        {"messages": [HumanMessage(content=user_question)]},
         config=config,
     )
 
-    # Helper to pretty‑print each message
-    def format_message(msg):
-        # If the message has plain content, return it
-        if hasattr(msg, "content") and msg.content:
-            return msg.content
-        # Otherwise it's a tool call; format nicely
-        if hasattr(msg, "tool_calls") and msg.tool_calls:
-            call = msg.tool_calls[0]
+    # Функция форматирования сообщений для вывода
+    def format_message(message: BaseMessage) -> str:
+        if isinstance(message, AIMessage):
+            return message.content or ""
+        # Если сообщение содержит вызов инструмента
+        if hasattr(message, "tool_calls") and message.tool_calls:
+            call = message.tool_calls[0]
             name = call["name"]
             args = call.get("args", {})
             return f"{name}({args})"
         return ""
 
-    sys.stdout.buffer.write(b"\n--- Conversation Trace ---\n\n")
-    for m in result["messages"]:
-        out = format_message(m)
-        sys.stdout.buffer.write((out + "\n---\n").encode("utf-8"))
+    # Выводим все сообщения (включая промежуточные вызовы)
+    print("\n--- Цепочка сообщений ---\n")
+    for msg in result["messages"]:
+        formatted = format_message(msg).replace("\u202f", " ")
+        if formatted:
+            print(formatted)
+
+    # Для удобства выводим итоговую таблицу и сумму
+    import re
+
+    def extract_price(table_text: str) -> int | None:
+        """
+        Извлекает первую числовую цену из строки таблицы.
+        Возвращает None, если цена не найдена.
+        """
+        match = re.search(r"(\d+)", table_text)
+        return int(match.group(1)) if match else None
+
+    # Ищем все таблицы в ответе
+    tables = re.findall(r"\|.*?\|\n\|.*?\|\n(?:\|.*?\|\n)+", result["messages"][-1].content or "")
+    total = 0
+    for tbl in tables:
+        price = extract_price(tbl)
+        if price is not None:
+            total += price
+
+    if total > 0:
+        print(f"\n**Итого:** ~{total} руб.")
